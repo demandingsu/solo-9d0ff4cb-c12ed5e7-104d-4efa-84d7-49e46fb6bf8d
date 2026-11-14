@@ -2,11 +2,15 @@
 # 端到端演示：docker compose up -d 后执行本脚本。
 # 场景覆盖：
 #   1. 多附件坏邮件 -> 停在该邮件、不留部分结果、返回邮件标识
-#   2. 移除坏邮件后续采 -> 断点继续、无新邮件即完成
-#   3. 原样重投 -> Message-ID + 附件摘要识别，不重复入库
-#   4. 邮箱重建（UIDVALIDITY 改变、UID 重排）-> 整箱重扫，重投全部跳过
-#   5. 同 Message-ID 但附件被改 -> 停采待核实，原结果保留
+#   2. 按样品查询 + 按结果 ID 溯源（邮件标识/附件名/记录序号）+ 原件下载
+#   3. 同名附件按 attach_index 区分
+#   4. 重启 API：启动恢复清理未引用原件，已发布原件保留，断点续采
+#   5. 移除坏邮件后续采 -> 断点继续、无新邮件即完成
+#   6. 原样重投 -> Message-ID + 附件摘要识别，不重复入库
+#   7. 邮箱重建（UIDVALIDITY 改变、UID 重排）-> 整箱重扫，重投全部跳过
+#   8. 同 Message-ID 但附件被改 -> 停采待核实，原结果保留
 # 用法： bash scripts/demo.sh
+# 也可以在浏览器打开 http://localhost:8000/docs 交互执行同样的接口。
 set -euo pipefail
 
 API="${API:-http://localhost:8000}"
@@ -30,8 +34,34 @@ line "2. 按样品查询 S-1001；坏邮件里的 S-1005 未部分入库（404�
 curl -sS "$API/results/S-1001" | show
 curl -sS -o /dev/null -w 'GET /results/S-1005 -> HTTP %{http_code}\n' "$API/results/S-1005"
 
+line "2b. 溯源：按结果 ID 查邮件标识、附件名、记录序号，并下载原始 CSV"
+RID=$(curl -sS "$API/results/S-1001" | python3 -c "import json,sys; print(json.load(sys.stdin)['results'][0]['id'])")
+echo "结果 ID=$RID 的溯源信息："
+curl -sS "$API/trace/$RID" | show
+ATT=$(curl -sS "$API/trace/$RID" | python3 -c "import json,sys; print(json.load(sys.stdin)['original']['attachment_id'])")
+curl -sS -o /tmp/trace_b1.csv -w "GET /attachments/$ATT/download -> HTTP %{http_code}\n" "$API/attachments/$ATT/download"
+echo "下载的原件内容："
+cat /tmp/trace_b1.csv
+
+line "2c. 同名附件区分：S-1003 与 S-1004 来自同一封邮件的两个 batch_b2.csv"
+for S in S-1003 S-1004; do
+  RID=$(curl -sS "$API/results/$S" | python3 -c "import json,sys; print(json.load(sys.stdin)['results'][0]['id'])")
+  curl -sS "$API/trace/$RID" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+o = d['original']
+print(f\"{d['sample_no']}: 附件序号={o['attach_index']} 文件名={o['filename']} sha256={o['sha256'][:16]}... 记录序号={o['record_seq']}\")"
+done
+curl -sS "$API/attachments?message_id=inst-0002@lab-instrument" | show
+
 line "3. 采集进度 last_uid=2，重启后从 UID3 续采"
 curl -sS "$API/ingest/state" | show
+
+line "3b. 重启 API：启动恢复（清理未引用原件、保全已发布原件），随后可续采"
+docker compose restart api >/dev/null
+until curl -sf "$API/health" >/dev/null 2>&1; do sleep 1; done
+echo "API 已恢复，原件仍可下载："
+curl -sS -o /dev/null -w "GET /attachments/$ATT/download -> HTTP %{http_code}\n" "$API/attachments/$ATT/download"
 
 line "4. 运维移除坏邮件 UID3，再次采集：无新邮件，正常完成"
 "${CTL[@]}" list

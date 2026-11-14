@@ -1,4 +1,4 @@
-"""演示用初始邮件：两封正常邮件 + 一封多附件坏 CSV 邮件。"""
+"""演示用初始邮件：两封正常邮件（第二封含两个同名附件）+ 一封多附件坏 CSV 邮件。"""
 from __future__ import annotations
 
 from . import mailbox
@@ -44,9 +44,11 @@ def seed(root: str, folder: str = "INBOX") -> None:
     )
     mailbox.append_message(root, folder, mail1)
 
+    # 第二封：两个同名附件 batch_b2.csv（不同仪器同名导出），
+    # 用于演示同名附件按邮件内序号 attach_index 区分
     mail2 = mailbox.build_message(
         message_id="inst-0002@lab-instrument",
-        subject="仪器结果 批次 B2",
+        subject="仪器结果 批次 B2（两个同名附件）",
         sender="instrument-b@lab.local",
         recipient="lab@lab.local",
         attachments=[
@@ -55,10 +57,17 @@ def seed(root: str, folder: str = "INBOX") -> None:
                 csv_text(
                     [
                         ("S-1003", "汞Hg", "0.005", "mg/kg"),
+                    ]
+                ),
+            ),
+            (
+                "batch_b2.csv",
+                csv_text(
+                    [
                         ("S-1004", "砷As", "0.012", "mg/kg"),
                     ]
                 ),
-            )
+            ),
         ],
     )
     mailbox.append_message(root, folder, mail2)

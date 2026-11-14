@@ -24,10 +24,12 @@ services:
     entrypoint: ["/entrypoint.sh", "api"]
     environment:
       COLLECTOR_DB: /data/collector.db
+      COLLECTOR_FILES: /files
     ports:
       - "8000:8000"
     volumes:
       - db_data:/data
+      - file_data:/files
     depends_on:
       imap:
         condition: service_healthy
@@ -48,3 +50,4 @@ services:
 volumes:
   mail_data:
   db_data:
+  file_data:

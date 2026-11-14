@@ -28,6 +28,8 @@ class ResultRecord:
     test_item: str
     result: str
     unit: str
+    # 附件内非空数据记录序号（从 1 起），用于从检测记录回溯原件中的行
+    seq: int = 0
 
     def as_tuple(self) -> tuple[str, str, str, str]:
         return (self.sample_no, self.test_item, self.result, self.unit)
@@ -68,7 +70,9 @@ def parse_csv(raw: bytes, attachment_name: str) -> list[ResultRecord]:
             raise CsvError(attachment_name, f"第 {line_no} 行结果为空")
         if not unit:
             raise CsvError(attachment_name, f"第 {line_no} 行单位为空")
-        records.append(ResultRecord(sample_no, test_item, result, unit))
+        records.append(
+            ResultRecord(sample_no, test_item, result, unit, seq=len(records) + 1)
+        )
 
     if not records:
         raise CsvError(attachment_name, "只有表头，没有检测记录")

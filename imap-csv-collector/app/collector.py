@@ -1,10 +1,15 @@
-"""IMAP 采集核心：拉取邮件 -> 解析 CSV -> 整封邮件原子入库。
+"""IMAP 采集核心：拉取邮件 -> 解析 CSV -> 留存原件 -> 整封邮件原子入库。
 
 保证：
-  * 一封邮件的全部 CSV 都解析成功，才在同一个 SQLite 事务里
-    一起提交检测记录、投递记录与 UID 进度；任一附件损坏则整封放弃。
+  * 一封邮件的全部 CSV 都解析成功后，先把全部附件解码后的原始字节
+    写入原件库（内容寻址，相同 SHA-256 只存一份），再在同一个
+    SQLite 事务里一起提交检测记录、来源关联（附件溯源）与 UID 进度；
+    解析、落盘或提交任一环节失败都整封放弃，无部分可查询结果。
   * 网络中断/坏附件/附件冲突都停在该邮件，不写部分结果；
     进度未推进，重启后从同一 UID 续采。
+  * 进程在落盘与提交之间退出：重启时 recover_storage 清理未被任何
+    已提交投递引用的原件，已发布原件保留，采集从断点续采；
+    失败清理只删未引用文件，其他邮件仍引用的原件不受影响。
   * UIDVALIDITY 改变后从头重新扫描；用 Message-ID + 附件摘要识别重投：
     同 Message-ID 且摘要相同 -> 跳过不重复入库；
     同 Message-ID 但摘要不同 -> 停采待人工核实，保留原结果。
@@ -15,12 +20,14 @@ import email
 import hashlib
 import imaplib
 import re
+import sqlite3
 from dataclasses import dataclass, field
 from email.message import Message
 from typing import Any
 
 from . import db
-from .csv_parse import CsvError, parse_csv
+from .blobstore import BlobStore
+from .csv_parse import CsvError, ResultRecord, parse_csv
 
 # 单次 FETCH 的规模控制（逐个拉取，失败边界即单封邮件）
 IMAP_TIMEOUT_SECONDS = 30
@@ -208,6 +215,67 @@ def _stop(report: IngestReport, err: IngestError) -> IngestReport:
     return report
 
 
+def _persist_originals(
+    store: BlobStore,
+    attachments: list[tuple[str, bytes]],
+    parsed: list[tuple[str, list[ResultRecord]]],
+) -> list[dict[str, Any]]:
+    """把整封邮件的全部附件原件落盘（先落盘、后提交的两段式前提）。
+
+    内容寻址：相同 SHA-256 只存一份，重复投递/多封邮件引用同一内容
+    不会重复占用存储。任一附件写盘失败抛 OSError，已写文件由调用方
+    按「未引用即清理」处理。
+    """
+    prepared: list[dict[str, Any]] = []
+    for attach_index, ((name, payload), (_, records)) in enumerate(
+        zip(attachments, parsed), start=1
+    ):
+        sha256 = store.put(payload)
+        prepared.append(
+            {
+                "attach_index": attach_index,
+                "filename": name,
+                "sha256": sha256,
+                "size": len(payload),
+                "records": records,
+            }
+        )
+    return prepared
+
+
+def _sweep_unreferenced(conn, store: BlobStore) -> None:
+    """失败清理：只删除未被任何已提交投递引用的原件文件。
+
+    相同 SHA-256 只存一份，其他邮件仍引用的文件必须保留；
+    清理本身失败不掩盖原始错误。
+    """
+    try:
+        store.sweep(db.list_blob_hashes(conn))
+    except OSError:
+        pass
+
+
+def recover_storage(
+    db_path: str | None = None, files_dir: str | None = None
+) -> dict[str, Any]:
+    """进程重启后的原件库恢复。
+
+    上次进程若在「落盘」与「提交」之间退出，会留下未被任何投递引用
+    的原件文件，这里全部清理；已提交投递引用的原件一律保留。
+    采集进度（ingest_state）不受影响，下次 collect 从断点续采。
+    """
+    conn = db.connect(db_path)
+    db.init_db(conn)
+    store = BlobStore(files_dir or db.get_files_dir(db_path))
+    store.ensure_dirs()
+    try:
+        removed = store.sweep(db.list_blob_hashes(conn))
+        kept = store.list_stored()
+    finally:
+        conn.close()
+    return {"removed_unreferenced": removed, "kept_referenced": kept}
+
+
 def collect(
     *,
     host: str,
@@ -217,15 +285,19 @@ def collect(
     password: str,
     use_ssl: bool = False,
     db_path: str | None = None,
+    files_dir: str | None = None,
 ) -> IngestReport:
     """执行一轮采集，返回结构化报告。任何失败都通过 report.stopped 表达。"""
     mailbox_key = make_mailbox_key(host, port, folder)
     conn = db.connect(db_path)
     db.init_db(conn)
+    store = BlobStore(files_dir or db.get_files_dir(db_path))
+    store.ensure_dirs()
     # 同一进程内串行化采集，避免两个请求并发推进同一邮箱进度
     with db._ingest_lock:
         report = _collect_locked(
             conn=conn,
+            store=store,
             mailbox_key=mailbox_key,
             host=host,
             port=port,
@@ -241,6 +313,7 @@ def collect(
 def _collect_locked(
     *,
     conn,
+    store: BlobStore,
     mailbox_key: str,
     host: str,
     port: int,
@@ -310,7 +383,7 @@ def _collect_locked(
                     )
 
                 # 先全部解析成功，再谈入库 —— 坏附件整封放弃
-                parsed: list[tuple[str, list]] = []
+                parsed: list[tuple[str, list[ResultRecord]]] = []
                 for name, payload in attachments:
                     try:
                         parsed.append((name, parse_csv(payload, name)))
@@ -348,33 +421,85 @@ def _collect_locked(
                         subject=subject,
                     )
 
-                all_records = [
-                    record.as_tuple()
-                    for _, records in parsed
-                    for record in records
-                ]
-                # 检测记录 + 投递识别 + UID 进度 同一事务原子提交
-                with db.transaction(conn):
-                    db.insert_results(
-                        conn, mailbox_key, message_id, uid, all_records
-                    )
-                    db.insert_delivery(
-                        conn, mailbox_key, message_id, digest,
-                        uid, remote_validity,
-                    )
-                    db.upsert_state(conn, mailbox_key, remote_validity, uid)
+                # 先备齐原件：全部附件解码后的原始字节写入原件库
+                # （内容寻址，相同 SHA-256 只存一份）；全部落盘成功后，
+                # 检测记录、来源关联与 UID 进度才在同一个事务提交。
+                try:
+                    prepared = _persist_originals(store, attachments, parsed)
+                except OSError as exc:
+                    _sweep_unreferenced(conn, store)
+                    raise IngestError(
+                        f"原件落盘失败，整封邮件未入库: {exc}",
+                        uid=uid,
+                        message_id=message_id,
+                        subject=subject,
+                    ) from exc
 
+                try:
+                    # 检测记录 + 附件溯源关联 + 投递识别 + UID 进度
+                    # 同一事务原子提交；失败时整体回滚，不留部分结果
+                    with db.transaction(conn):
+                        for item in prepared:
+                            db.insert_blob(conn, item["sha256"], item["size"])
+                            attachment_id = db.insert_attachment(
+                                conn,
+                                mailbox_key,
+                                message_id,
+                                item["attach_index"],
+                                item["filename"],
+                                item["sha256"],
+                                item["size"],
+                                len(item["records"]),
+                            )
+                            db.insert_results(
+                                conn,
+                                mailbox_key,
+                                message_id,
+                                uid,
+                                attachment_id,
+                                [
+                                    (record.seq, *record.as_tuple())
+                                    for record in item["records"]
+                                ],
+                            )
+                        db.insert_delivery(
+                            conn, mailbox_key, message_id, digest,
+                            uid, remote_validity,
+                        )
+                        db.upsert_state(conn, mailbox_key, remote_validity, uid)
+                except (sqlite3.Error, OSError) as exc:
+                    # 事务已回滚：清掉本次落盘但未被引用的原件；
+                    # 其他邮件仍引用的文件（相同 SHA-256）保留
+                    _sweep_unreferenced(conn, store)
+                    raise IngestError(
+                        f"检测记录提交失败，整封邮件未入库: {exc}",
+                        uid=uid,
+                        message_id=message_id,
+                        subject=subject,
+                    ) from exc
+
+                total_records = sum(len(item["records"]) for item in prepared)
                 report.ingested.append(
                     {
                         "uid": uid,
                         "message_id": message_id,
                         "subject": subject,
-                        "attachments": [name for name, _ in attachments],
-                        "record_count": len(all_records),
+                        "attachments": [
+                            {
+                                "attach_index": item["attach_index"],
+                                "filename": item["filename"],
+                                "sha256": item["sha256"],
+                                "size_bytes": item["size"],
+                                "record_count": len(item["records"]),
+                            }
+                            for item in prepared
+                        ],
+                        "record_count": total_records,
                         "attachment_digest": digest,
+                        "originals_retained": True,
                     }
                 )
-                report.total_new_records += len(all_records)
+                report.total_new_records += total_records
                 last_uid = uid
                 report.resume_from_uid = last_uid + 1
             except IngestError as exc:
