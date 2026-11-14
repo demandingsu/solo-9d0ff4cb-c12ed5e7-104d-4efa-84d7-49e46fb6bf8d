@@ -1,0 +1,50 @@
+services:
+  imap:
+    build: .
+    image: imap-csv-collector:latest
+    entrypoint: ["/entrypoint.sh", "imap"]
+    environment:
+      MAIL_ROOT: /srv/mail
+      MAIL_USER: instrument@lab.local
+      MAIL_PASSWORD: labpass
+      FLAKY_FETCH_AFTER: "0"
+    ports:
+      - "10143:10143"
+    volumes:
+      - mail_data:/srv/mail
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import socket; s=socket.create_connection(('127.0.0.1',10143),3); s.close()\""]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    image: imap-csv-collector:latest
+    entrypoint: ["/entrypoint.sh", "api"]
+    environment:
+      COLLECTOR_DB: /data/collector.db
+    ports:
+      - "8000:8000"
+    volumes:
+      - db_data:/data
+    depends_on:
+      imap:
+        condition: service_healthy
+
+  # 演示控制：对样例邮箱执行重投/重建/修复等操作
+  mailctl:
+    image: imap-csv-collector:latest
+    entrypoint: ["python", "-m", "imap_server.cli", "--root", "/srv/mail"]
+    environment:
+      MAIL_ROOT: /srv/mail
+    volumes:
+      - mail_data:/srv/mail
+    depends_on:
+      imap:
+        condition: service_healthy
+    profiles: ["tools"]
+
+volumes:
+  mail_data:
+  db_data:
